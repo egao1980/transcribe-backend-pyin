@@ -16,20 +16,20 @@ A [transcribe-protocol](https://github.com/egao1980/transcribe-protocol) backend
 ;;   frames a second, voicing per frame), TUNING-OFFSET, DRIFT, KEY-FIT, ...
 ```
 
-**Status:** slice T1 (0.1.0) is a **contract**: the functions below are stubs, and a team-solve run implements them. The design is in the capability brief [cl-stack/docs/capabilities/transcribe.md](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/transcribe.md). Each file header in `src/` states its rules, and the Rove suite in `tests/` is the spec.
+**Status:** slice T1 (0.1.0) is **implemented**: the Rove suite (77 tests) passes, the 3-minute take within 8 times the YIN baseline. The design is in the capability brief [cl-stack/docs/capabilities/transcribe.md](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/transcribe.md). Each file header in `src/` states its rules, and the Rove suite in `tests/` is the spec.
 
 | File | What | Status |
 |------|------|--------|
 | `src/transcriber.lisp` | `pyin-transcriber`: initargs (`:frame-size`, `:hop`, `:gate-db`, `:min-duration`, `:vibrato-window`), their checks, `transcriber-info` | T1, given |
 | `src/candidates.lisp` | `+threshold-count+`, `+beta-prior+`, `+no-trough-probability+` | T1, given |
-| | `threshold-prior` (Beta(2, 18) over 100 thresholds, exact), `pitch-candidates` (one frame's troughs, periods and probabilities) | T1, contract |
+| | `threshold-prior` (Beta(2, 18) over 100 thresholds, exact), `pitch-candidates` (one frame's troughs, periods and probabilities) | T1, implemented |
 | `src/pitch.lisp` | `+bins-per-semitone+`, `+max-transition-rate+`, `+switch-probability+`, `+probability-floor+` | T1, given |
-| | `pitch-bin-count`, `pitch-max-jump`, `decode-pitch` (the pitch and voicing HMM, Viterbi), `pyin-contour` | T1, contract |
+| | `pitch-bin-count`, `pitch-max-jump`, `decode-pitch` (the pitch and voicing HMM, Viterbi), `pyin-contour` | T1, implemented |
 | `src/onsets.lisp` | `+dip-db+`, `+dip-span+` | T1, given |
-| | `onset-frames` (re-articulation dips) | T1, contract |
+| | `onset-frames` (re-articulation dips) | T1, implemented |
 | `src/notes.lisp` | the note HMM's constants | T1, given |
-| | `contour-notes` (vibrato smoothing, the note HMM, note events) | T1, contract |
-| `src/detect.lisp` | the `detect-notes` method | T1, contract |
+| | `contour-notes` (vibrato smoothing, the note HMM, note events) | T1, implemented |
+| `src/detect.lisp` | the `detect-notes` method | T1, implemented |
 
 ```sh
 CL_REPO_DYNAMIC_SPACE_MB=2048 cl-repo test --system transcribe-backend-pyin

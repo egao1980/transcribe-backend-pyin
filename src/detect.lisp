@@ -18,5 +18,15 @@
 (in-package #:transcribe-backend-pyin)
 
 (defmethod tp:detect-notes ((p pyin-transcriber) audio hints)
-  (declare (ignorable p audio hints))
-  (%t1-pending 'detect-notes))
+  (let* ((range (tp:hint-pitch-range hints))
+         (hop (pyin-transcriber-hop p))
+         (contour (pyin-contour audio :frame-size (pyin-transcriber-frame-size p)
+                                      :hop hop
+                                      :gate-db (pyin-transcriber-gate-db p)
+                                      :pitch-range range))
+         (onsets (onset-frames audio :hop hop))
+         (notes (contour-notes contour :onsets onsets
+                                       :pitch-range range
+                                       :min-duration (pyin-transcriber-min-duration p)
+                                       :vibrato-window (pyin-transcriber-vibrato-window p))))
+    (values notes contour)))

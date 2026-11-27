@@ -42,8 +42,54 @@
 (defconstant +dip-span+ 1/20
   "Seconds searched on each side of a dip.")
 
+(defun %dip-p (e j span g)
+  "True when step J of the envelope E is a dip: E_j below every value of the
+SPAN steps before it and at most every value of the SPAN steps after it (both
+sides clipped to E, and not empty), and both sides' loudest values above G
+times E_j."
+  (declare (type (simple-array double-float (*)) e) (type fixnum j span)
+           (type double-float g) (optimize speed))
+  (let ((ej (aref e j))
+        (lmax 0d0)
+        (rmax 0d0))
+    (declare (type double-float ej lmax rmax))
+    (loop for k of-type fixnum from (max 0 (- j span)) below j
+          do (let ((v (aref e k)))
+               (unless (< ej v) (return-from %dip-p nil))
+               (when (> v lmax) (setf lmax v))))
+    (loop for k of-type fixnum from (1+ j) to (min (1- (length e)) (+ j span))
+          do (let ((v (aref e k)))
+               (unless (<= ej v) (return-from %dip-p nil))
+               (when (> v rmax) (setf rmax v))))
+    (let ((level (* g ej)))
+      (and (> lmax level) (> rmax level)))))
+
 (defun onset-frames (audio &key (hop 128))
   "The frames of AUDIO (a mono PCM-BUFFER) where its level dips between two
 louder stretches: re-articulations. See onsets.lisp."
-  (declare (ignorable audio hop))
-  (%t1-pending 'onset-frames))
+  (check-type audio (satisfies %mono-buffer-p) "a one-channel PCM-BUFFER")
+  (check-type hop (integer 1))
+  (let* ((s (audio:pcm-buffer-sample-rate audio))
+         (q (max 1 (floor hop 4)))
+         (r (max 1 (floor hop 2)))
+         ;; e_j: the RMS of the 2r samples from jq - r, zeros outside the
+         ;; audio; ceiling(L / q) steps.
+         (e (dsp:frame-rms audio (* 2 r) q))
+         (steps (length e))
+         (span (max 1 (round (* +dip-span+ s) q)))
+         (g (audio:db-to-gain +dip-db+))
+         (half (floor hop 2))
+         (frames '()))
+    (declare (type (simple-array double-float (*)) e))
+    ;; Both sides non-empty: steps 1 .. J - 2. A dip's own neighbours are
+    ;; tested first, as most steps fail there.
+    (loop for j from 1 below (1- steps)
+          do (let ((ej (aref e j)))
+               (when (and (< ej (aref e (1- j)))
+                          (<= ej (aref e (1+ j)))
+                          (%dip-p e j span g))
+                 (let ((frame (floor (+ (* j q) half) hop)))
+                   ;; J rises, so the frames never fall: drop repeats.
+                   (unless (eql frame (first frames))
+                     (push frame frames))))))
+    (nreverse frames)))

@@ -29,11 +29,6 @@
 
 (in-package #:transcribe-backend-pyin)
 
-(defun %t1-pending (name)
-  "Contract stub for slice T1. Every call is replaced by the implementation,
-then this function is deleted."
-  (error "transcribe-backend-pyin T1 pending: ~A" name))
-
 ;;; Predicates for the argument checks of every file.
 
 (defun %proper-list-p (x)

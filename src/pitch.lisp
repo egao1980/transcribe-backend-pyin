@@ -96,24 +96,276 @@
 (defconstant +probability-floor+ 1d-300
   "Probabilities enter the HMM's logarithms as max(p, +PROBABILITY-FLOOR+).")
 
+(deftype %doubles ()
+  "The typed vectors of the HMMs' inner loops."
+  '(simple-array double-float (*)))
+
 (defun pitch-bin-count (pitch-range)
   "The number of 10-cent pitch bins over PITCH-RANGE (low high). See pitch.lisp."
-  (declare (ignorable pitch-range))
-  (%t1-pending 'pitch-bin-count))
+  (check-type pitch-range (satisfies %pitch-range-p) "a list (low high) of reals, 0 <= low < high < 128")
+  (destructuring-bind (low high) pitch-range
+    (1+ (floor (* +bins-per-semitone+ (- (rational high) (rational low)))))))
 
 (defun pitch-max-jump (hop sample-rate)
   "The largest pitch change between frames, in bins, at HOP and SAMPLE-RATE. See pitch.lisp."
-  (declare (ignorable hop sample-rate))
-  (%t1-pending 'pitch-max-jump))
+  (check-type hop (integer 1))
+  (check-type sample-rate (integer 1))
+  (max 1 (round (* +max-transition-rate+ 12 +bins-per-semitone+ hop) sample-rate)))
+
+;;; DECODE-PITCH's arguments. The bound on the bins needs BIN-COUNT, which is
+;;; checked after OBSERVATIONS: OBSERVATIONS is checked for its shape first,
+;;; then once more against the bound, both times by CHECK-TYPE.
+
+(defvar *%bin-count* nil
+  "While DECODE-PITCH checks its observations against its bin count n: n, the
+bound every bin stays below. Otherwise NIL.")
+
+(defun %pitch-observations-p (x)
+  "True for a list or vector of frames, each a list of (bin . probability)
+conses, BIN an integer >= 0 (and below *%BIN-COUNT* when that is bound) and
+PROBABILITY a non-negative real."
+  (and (or (vectorp x) (%proper-list-p x))
+       (every (lambda (frame)
+                (and (%proper-list-p frame)
+                     (every (lambda (pair)
+                              (and (consp pair)
+                                   (typep (car pair) '(integer 0))
+                                   (or (null *%bin-count*) (< (car pair) *%bin-count*))
+                                   (typep (cdr pair) '(real 0))))
+                            frame)))
+             x)))
+
+(defun %log-probability (p)
+  "log(max(P, +PROBABILITY-FLOOR+)) for a non-negative real P, a DOUBLE-FLOAT.
+P is compared with the floor exactly, so a P too small for a double meets it."
+  (if (< p +probability-floor+)
+      (log +probability-floor+)
+      (log (float p 1d0))))
+
+;;; The band step: frame i - 1's deltas PV (voiced) and PU (unvoiced) to frame
+;;; i's CV and CU. For each target bin b, one pass over the band b' = b - B' ..
+;;; b + B' (B' = min(B, n - 1), clipped to the range) gives the band maxima
+;;; MV(b) = max delta_V(b') + log w(b - b') and MU(b) likewise, scanned upward
+;;; with a strict > (the smallest b' of equal ones). Then
+;;;   delta_V(b) = log O_V(b) + max(MV(b) + log(1 - s), MU(b) + log s)
+;;;   delta_U(b) = log O_U    + max(MV(b) + log s, MU(b) + log(1 - s)),
+;;; the voiced predecessor winning a tie (its index is the smaller). The
+;;; backpointer of target x (V b = b, U b = n + b) goes to BP[BASE + x]. Two
+;;; copies: backpointers of 16 bits, and of 32 bits when 2n > 65536.
+
+(macrolet ((define-band-step (name element-type)
+             `(defun ,name (pv pu cv cu lw logov logou lstay lswitch n band bp base)
+                "One frame of the pitch Viterbi: see the band step above."
+                (declare (type %doubles pv pu cv cu lw logov)
+                         (type double-float logou lstay lswitch)
+                         (type (integer 1 #.(floor most-positive-fixnum 4)) n)
+                         (type (integer 0 #.(floor most-positive-fixnum 4)) band)
+                         (type (integer 0 #.(floor most-positive-fixnum 2)) base)
+                         (type (simple-array ,element-type (*)) bp)
+                         (optimize speed (safety 0)))
+                (dotimes (b n)
+                  (let* ((lo (max 0 (- b band)))
+                         (hi (min (1- n) (+ b band)))
+                         (l (aref lw (- b lo)))
+                         (mv (+ (aref pv lo) l))
+                         (av lo)
+                         (mu (+ (aref pu lo) l))
+                         (au lo))
+                    (declare (type fixnum lo hi av au) (type double-float l mv mu))
+                    (loop for b2 of-type fixnum from (1+ lo) to b
+                          do (let* ((l (aref lw (- b b2)))
+                                    (x (+ (aref pv b2) l))
+                                    (y (+ (aref pu b2) l)))
+                               (when (> x mv) (setf mv x av b2))
+                               (when (> y mu) (setf mu y au b2))))
+                    (loop for b2 of-type fixnum from (1+ b) to hi
+                          do (let* ((l (aref lw (- b2 b)))
+                                    (x (+ (aref pv b2) l))
+                                    (y (+ (aref pu b2) l)))
+                               (when (> x mv) (setf mv x av b2))
+                               (when (> y mu) (setf mu y au b2))))
+                    (let ((vv (+ mv lstay))
+                          (uv (+ mu lswitch)))
+                      (if (>= vv uv)
+                          (setf (aref cv b) (+ (aref logov b) vv)
+                                (aref bp (+ base b)) av)
+                          (setf (aref cv b) (+ (aref logov b) uv)
+                                (aref bp (+ base b)) (+ n au))))
+                    (let ((vu (+ mv lswitch))
+                          (uu (+ mu lstay)))
+                      (if (>= vu uu)
+                          (setf (aref cu b) (+ logou vu)
+                                (aref bp (+ base n b)) av)
+                          (setf (aref cu b) (+ logou uu)
+                                (aref bp (+ base n b)) (+ n au)))))))))
+  (define-band-step %pitch-step/16 (unsigned-byte 16))
+  (define-band-step %pitch-step/32 (unsigned-byte 32)))
+
+(defun %decode-pitch (frames n jump switch)
+  "DECODE-PITCH on checked arguments, FRAMES a SIMPLE-VECTOR of frames."
+  (let ((count (length frames)))
+    (when (zerop count)
+      (return-from %decode-pitch (vector)))
+    (let* ((states (* 2 n))
+           (band (min jump (1- n)))
+           (wide (> states 65536))
+           (bp (make-array (* (1- count) states)
+                           :element-type (if wide '(unsigned-byte 32) '(unsigned-byte 16))))
+           (lw (make-array (1+ band) :element-type 'double-float))
+           (lfloor (%log-probability 0))
+           (lstay (%log-probability (- 1 switch)))
+           (lswitch (%log-probability switch))
+           (linit (%log-probability (/ 1 states)))
+           (pv (make-array n :element-type 'double-float))
+           (pu (make-array n :element-type 'double-float))
+           (cv (make-array n :element-type 'double-float))
+           (cu (make-array n :element-type 'double-float))
+           ;; log O_V of the current frame: the floor but where it has
+           ;; candidates. SUMS and SEEN are reset after each frame.
+           (logov (make-array n :element-type 'double-float :initial-element lfloor))
+           (sums (make-array n :initial-element 0))
+           (seen (make-array n :element-type 'bit :initial-element 0))
+           (touched '())
+           (logou 0d0))
+      (declare (type %doubles pv pu cv cu logov lw) (type double-float logou))
+      ;; w(d) = (B + 1 - d) / (B + 1)^2 for the true B, d = 0 .. B'.
+      (dotimes (d (1+ band))
+        (setf (aref lw d) (%log-probability (/ (- (1+ jump) d) (expt (1+ jump) 2)))))
+      (flet ((observe (frame)
+               ;; O_V(b): the sum of FRAME's probabilities of bin b; O_U =
+               ;; (1 - min(1, the sum of them all)) / n.
+               (let ((total 0))
+                 (dolist (pair frame)
+                   (let ((bin (car pair)))
+                     (when (zerop (sbit seen bin))
+                       (setf (sbit seen bin) 1)
+                       (push bin touched))
+                     (setf (svref sums bin) (+ (svref sums bin) (cdr pair))
+                           total (+ total (cdr pair)))))
+                 (dolist (bin touched)
+                   (setf (aref logov bin) (%log-probability (svref sums bin))))
+                 (setf logou (%log-probability (/ (- 1 (min 1 total)) n)))))
+             (forget ()
+               (dolist (bin touched)
+                 (setf (aref logov bin) lfloor
+                       (svref sums bin) 0
+                       (sbit seen bin) 0))
+               (setf touched '())))
+        (observe (svref frames 0))
+        (dotimes (b n)
+          (setf (aref cv b) (+ linit (aref logov b))
+                (aref cu b) (+ linit logou)))
+        (forget)
+        (loop for i from 1 below count
+              do (rotatef pv cv)
+                 (rotatef pu cu)
+                 (observe (svref frames i))
+                 (if wide
+                     (%pitch-step/32 pv pu cv cu lw logov logou lstay lswitch n band bp
+                                     (* (1- i) states))
+                     (%pitch-step/16 pv pu cv cu lw logov logou lstay lswitch n band bp
+                                     (* (1- i) states)))
+                 (forget)))
+      ;; The end state: the largest delta, V before U and lower bins first.
+      (let ((end 0)
+            (best (aref cv 0)))
+        (declare (type double-float best))
+        (dotimes (b n)
+          (when (> (aref cv b) best) (setf best (aref cv b) end b)))
+        (dotimes (b n)
+          (when (> (aref cu b) best) (setf best (aref cu b) end (+ n b))))
+        (let ((path (make-array count))
+              (x end))
+          (loop for i from (1- count) downto 0
+                do (setf (svref path i) (and (< x n) x))
+                   (when (plusp i)
+                     (setf x (aref bp (+ (* (1- i) states) x)))))
+          path)))))
 
 (defun decode-pitch (observations bin-count max-jump &key (switch-probability +switch-probability+))
   "The Viterbi path of pYIN's pitch and voicing HMM: a bin per voiced frame,
 NIL per unvoiced one. See pitch.lisp."
-  (declare (ignorable observations bin-count max-jump switch-probability))
-  (%t1-pending 'decode-pitch))
+  (check-type observations (satisfies %pitch-observations-p)
+              "a list or vector of frames, each a list of (bin . probability) conses")
+  (check-type bin-count (integer 1))
+  (check-type max-jump (integer 0))
+  (check-type switch-probability (real (0) (1)))
+  (let ((*%bin-count* bin-count))
+    (check-type observations (satisfies %pitch-observations-p)
+                "a list or vector of frames of (bin . probability) conses, each bin below BIN-COUNT"))
+  (%decode-pitch (coerce observations 'simple-vector) bin-count max-jump switch-probability))
+
+;;; PYIN-CONTOUR
+
+(defun %frame-samples (frame samples start)
+  "FRAME, a DOUBLE-FLOAT vector, filled with SAMPLES from index START on (as
+doubles), 0 outside SAMPLES."
+  (declare (type %doubles frame) (type audio:sample-vector samples) (type fixnum start)
+           (optimize speed))
+  (let ((size (length frame))
+        (length (length samples)))
+    (fill frame 0d0)
+    (loop for j of-type fixnum from (max 0 (- start)) below (min size (- length start))
+          do (setf (aref frame j) (float (aref samples (+ start j)) 1d0)))
+    frame))
+
+(defun %candidate-bin (f0 low n)
+  "The pitch bin of F0 Hz: round(10 ((hz-to-midi f0) - LOW)), clamped to 0 .. N - 1."
+  (max 0 (min (1- n) (round (* +bins-per-semitone+ (- (tp:hz-to-midi f0) low))))))
 
 (defun pyin-contour (audio &key (frame-size 1024) (hop 128) (gate-db -40) (pitch-range '(36 84)))
   "pYIN's f0 contour of AUDIO, a mono PCM-BUFFER: candidates under the beta
 threshold prior, a level gate, the pitch HMM's Viterbi path. See pitch.lisp."
-  (declare (ignorable audio frame-size hop gate-db pitch-range))
-  (%t1-pending 'pyin-contour))
+  (check-type audio (satisfies %mono-buffer-p) "a one-channel PCM-BUFFER")
+  (check-type frame-size (and (integer 4) (satisfies evenp)) "an even integer >= 4")
+  (check-type hop (integer 1))
+  (check-type gate-db (real * 0))
+  (check-type pitch-range (satisfies %pitch-range-p) "a list (low high) of reals, 0 <= low < high < 128")
+  (let* ((s (audio:pcm-buffer-sample-rate audio))
+         (samples (audio:pcm-buffer-samples audio))
+         (w (floor frame-size 2))
+         (low (rational (first pitch-range)))
+         (high (rational (second pitch-range)))
+         (n (pitch-bin-count pitch-range))
+         (count (dsp:frame-count (length samples) w hop))
+         ;; l_i: the RMS of frame i's integration window, the W samples from
+         ;; (frame-start i w hop), zeros outside the audio.
+         (levels (dsp:frame-rms audio w hop))
+         (loudest (reduce #'max levels :initial-value 0d0))
+         (gate (* (audio:db-to-gain gate-db) loudest))
+         (tau-lo (max 2 (floor s (tp:midi-to-hz high))))
+         (tau-hi (min (1- w) (ceiling s (tp:midi-to-hz low))))
+         (frame (make-array frame-size :element-type 'double-float :initial-element 0d0))
+         ;; Per frame: its (bin tau* . p) candidates, and its (bin . p) pairs.
+         (binned (make-array count :initial-element '()))
+         (observations (make-array count :initial-element '()))
+         (voicing (make-array count :element-type 'double-float :initial-element 0d0)))
+    (declare (type %doubles levels))
+    (when (plusp loudest)
+      (dotimes (i count)
+        (unless (< (aref levels i) gate)
+          (%frame-samples frame samples (dsp:frame-start i w hop))
+          (multiple-value-bind (candidates voiced)
+              (pitch-candidates (dsp:yin-cmndf frame :window w) tau-lo tau-hi)
+            (let ((these (mapcar (lambda (c) (list* (%candidate-bin (/ s (car c)) low n) c))
+                                 candidates)))
+              (setf (svref binned i) these
+                    (svref observations i) (mapcar (lambda (e) (cons (first e) (cddr e))) these)
+                    (aref voicing i) (float voiced 1d0)))))))
+    (let ((path (decode-pitch observations n (pitch-max-jump hop s)))
+          (f0 (make-array count :initial-element nil)))
+      (dotimes (i count)
+        (let ((b (svref path i)))
+          (when b
+            ;; The most probable candidate of the frame in bin B, the first in
+            ;; lag order of equal ones; else the bin's own pitch.
+            (let ((best nil))
+              (dolist (e (svref binned i))
+                (when (and (= (first e) b)
+                           (or (null best) (> (cddr e) (cddr best))))
+                  (setf best e)))
+              (setf (svref f0 i)
+                    (if best
+                        (/ s (second best))
+                        (tp:midi-to-hz (+ low (/ b +bins-per-semitone+)))))))))
+      (tp:make-f0-contour :sample-rate s :hop hop :f0 f0 :voicing voicing))))
